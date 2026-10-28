@@ -184,6 +184,15 @@ impl Action {
     }
 }
 
+/// Optional work skipped because a deadline had already passed (logged).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Skip {
+    PurePass,
+    Subsumption,
+    PreprocessRound,
+    Inprocess,
+}
+
 /// Fixed-size log record — no strings, no heap.
 #[derive(Copy, Clone, Debug)]
 pub enum EventKind {
@@ -197,6 +206,7 @@ pub enum EventKind {
     Reduce { kept: u32, deleted: u32 },
     Probe { fixed: u32, failed: u32 },
     Verified { sat: bool, unsat_clauses: u32 },
+    Skipped { what: Skip },
     Timeout,
 }
 
@@ -228,6 +238,10 @@ pub struct Config {
     pub relaxation: bool,
     /// SLS flip rule.
     pub sls_rule: SlsRule,
+    /// Optional pre-/in-processing passes (pure literals, subsumption) stop
+    /// once this share of `timeout_ms` (ppm) has elapsed since the start of
+    /// `solve()` (pre-) or of the pass (in-). The first root rebuild is mandatory.
+    pub preprocess_budget_ppm: u32,
 }
 
 /// Local-search variable selection inside a random unsat clause.
@@ -255,6 +269,7 @@ impl Default for Config {
             learning: true,
             relaxation: true,
             sls_rule: SlsRule::ProbSat,
+            preprocess_budget_ppm: 150_000,
         }
     }
 }

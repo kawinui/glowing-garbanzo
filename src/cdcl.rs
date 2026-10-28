@@ -317,7 +317,11 @@ impl SolverWorkspace {
         let start = self.stats.conflicts;
         let mut restart_limit = luby(self.hot.luby_idx) * RESTART_UNIT;
         loop {
+            // Ticker units follow the propagation work, read around (never inside)
+            // `propagate()`: one conflict on a huge instance can touch 10^5 literals.
+            let p0 = self.stats.propagations;
             let confl = self.propagate();
+            let units = work_units(self.stats.propagations - p0);
             if confl != NIL {
                 self.stats.conflicts += 1;
                 if self.hot.dlevel == 0 {
@@ -352,12 +356,12 @@ impl SolverWorkspace {
                         return Burst::RootConflict;
                     }
                 }
-                if self.stats.conflicts - start >= max_conflicts || ticker.tick() {
+                if self.stats.conflicts - start >= max_conflicts || ticker.tick_n(units) {
                     self.backtrack(0);
                     return Burst::Budget;
                 }
             } else {
-                if ticker.tick() {
+                if ticker.tick_n(units) {
                     self.backtrack(0);
                     return Burst::Budget;
                 }

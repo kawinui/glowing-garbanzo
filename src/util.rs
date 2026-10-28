@@ -214,6 +214,18 @@ impl Rng {
 // Deadline ticker: reads the clock only every `period` ticks.
 // ---------------------------------------------------------------------------
 
+/// True once `t` has been reached. Never call from `propagate()`.
+#[inline]
+pub(crate) fn past(t: Instant) -> bool {
+    Instant::now() >= t
+}
+
+/// Ticker units for a step that propagated `dprops` literals: `1 + dprops / 64`.
+#[inline(always)]
+pub(crate) fn work_units(dprops: u64) -> i32 {
+    1 + (dprops >> 6).min(1 << 20) as i32
+}
+
 pub struct Ticker {
     end: Instant,
     countdown: i32,
@@ -227,7 +239,13 @@ impl Ticker {
     }
     #[inline(always)]
     pub fn tick(&mut self) -> bool {
-        self.countdown -= 1;
+        self.tick_n(1)
+    }
+    /// Account `units` of work (a step that cost more than one tick); the
+    /// clock is read whenever the accumulated work crosses `period`.
+    #[inline(always)]
+    pub fn tick_n(&mut self, units: i32) -> bool {
+        self.countdown -= units;
         if self.countdown <= 0 {
             self.countdown = self.period;
             if Instant::now() >= self.end {

@@ -11,6 +11,7 @@
 //!   zsat <file.cnf> [--timeout MS] [--mem MiB] [--seed N] [--model] [--log] [--no-learning] [--no-relax] [--steepest]
 //!   zsat --bench [--timeout MS]
 //!   zsat --selftest [COUNT]
+//!   zsat --deadline-check
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
@@ -249,6 +250,8 @@ struct RunReport {
     allocs: u64,
     model_ok: Option<bool>,
     best_unsat: u32,
+    /// False when UNKNOWN came back before any assignment was evaluated.
+    has_best: bool,
 }
 
 fn run(name: &str, f: &Formula, cfg: Config, verbose: bool, print_log: bool, print_model: bool) -> RunReport {
@@ -257,7 +260,7 @@ fn run(name: &str, f: &Formula, cfg: Config, verbose: bool, print_log: bool, pri
         Ok(s) => s,
         Err(e) => {
             println!("c [{name}] LOAD REFUSED: {e}");
-            return RunReport { status: Status::Unknown, ms: 0.0, allocs: 0, model_ok: None, best_unsat: u32::MAX };
+            return RunReport { status: Status::Unknown, ms: 0.0, allocs: 0, model_ok: None, best_unsat: u32::MAX, has_best: false };
         }
     };
     let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
@@ -336,9 +339,15 @@ fn run(name: &str, f: &Formula, cfg: Config, verbose: bool, print_log: bool, pri
             Some(false) => "  model=INVALID!".to_string(),
             None => String::new(),
         },
-        if status == Status::Unknown { format!("  best-so-far violates {} clauses", s.best_unsat) } else { String::new() }
+        match (status, s.has_best()) {
+            (Status::Unknown, true) => format!("  best-so-far violates {} clauses", s.best_unsat),
+            (Status::Unknown, false) => "  no assignment evaluated within budget".to_string(),
+            _ => String::new(),
+        }
     );
-    if print_model && status != Status::Unsat {
+    if print_model && status == Status::Unknown && !s.has_best() {
+        println!("c no best-so-far assignment");
+    } else if print_model && status != Status::Unsat {
         let get = |v| if status == Status::Sat { s.model_value(v) } else { s.best_value(v) };
         let mut line = String::from("v");
         for v in 0..f.num_vars {
@@ -351,7 +360,7 @@ fn run(name: &str, f: &Formula, cfg: Config, verbose: bool, print_log: bool, pri
         }
         println!("{line} 0");
     }
-    RunReport { status, ms, allocs, model_ok, best_unsat: s.best_unsat }
+    RunReport { status, ms, allocs, model_ok, best_unsat: s.best_unsat, has_best: s.has_best() }
 }
 
 fn check_one(f: &Formula, truth: bool, seed: u64, tag: &str, base: Config) -> (Status, bool) {
@@ -437,7 +446,7 @@ fn bench(timeout_ms: u64) -> bool {
             format!("{:?}", r.status),
             r.ms,
             r.allocs,
-            if r.status == Status::Unknown { r.best_unsat.to_string() } else { "-".into() },
+            if r.status == Status::Unknown && r.has_best { r.best_unsat.to_string() } else { "-".into() },
             if *c { "" } else { "   <-- WRONG" }
         );
     }
@@ -445,10 +454,56 @@ fn bench(timeout_ms: u64) -> bool {
     ok
 }
 
+/// Release-build check that `solve()` returns within `timeout + bounded overshoot`
+/// on a mid-size and a very large instance, and that UNKNOWN reports honestly.
+fn deadline_check() -> bool {
+    let cases: Vec<(&str, Formula, usize)> = vec![
+        ("mid-300k-r4.0", random_ksat(300_000, 1_200_000, 3, 31), 512 << 20),
+        ("big-2M-8M", random_ksat(2_000_000, 8_000_000, 3, 32), 2048 << 20),
+    ];
+    let mut ok = true;
+    println!("c {:<14} {:>8} {:>9} {:>12} {:>9} {:>9} {:>9} {:>6}", "instance", "timeout", "solve_ms", "overshoot_ms", "limit_ms", "status", "has_best", "allocs");
+    for (name, f, mem) in &cases {
+        let (rebuild_ms, eval_ms) = {
+            let cfg = Config { timeout_ms: 1, memory_budget: *mem, ..Config::default() };
+            Solver::new(f, cfg).expect("load").diag_costs()
+        };
+        println!("c {name}: one rebuild = {rebuild_ms:.1} ms, one full eval = {eval_ms:.1} ms (overshoot bound = rebuild + eval + 20 ms)");
+        for t in [50u64, 100, 1000] {
+            let cfg = Config { timeout_ms: t, memory_budget: *mem, ..Config::default() };
+            let mut s = Solver::new(f, cfg).expect("load");
+            ARMED_ALLOCS.store(0, Relaxed);
+            ARMED.store(true, Relaxed);
+            let t0 = Instant::now();
+            let status = s.solve();
+            let ms = t0.elapsed().as_secs_f64() * 1e3;
+            ARMED.store(false, Relaxed);
+            let allocs = ARMED_ALLOCS.load(Relaxed);
+            // acceptance: the only unstoppable units are one rebuild and one eval
+            let limit = t as f64 + rebuild_ms + eval_ms + 20.0;
+            let mut pass = ms <= limit && allocs == 0;
+            if status == Status::Unknown && s.has_best() {
+                pass &= count_violated(f, |v| s.best_value(v)) == s.best_unsat as usize;
+            }
+            if status == Status::Sat {
+                pass &= count_violated(f, |v| s.model_value(v)) == 0;
+            }
+            ok &= pass;
+            println!(
+                "c {:<14} {:>8} {:>9.1} {:>12.1} {:>9.0} {:>9} {:>9} {:>6}{}",
+                name, t, ms, ms - t as f64, limit, format!("{status:?}"), s.has_best(), allocs,
+                if pass { "" } else { "   <-- FAIL" }
+            );
+        }
+    }
+    ok
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut cfg = Config::default();
     let (mut file, mut do_bench, mut do_self, mut self_n) = (None, false, false, 3000u32);
+    let mut do_deadline = false;
     let (mut model, mut log) = (false, false);
     let mut i = 0;
     while i < args.len() {
@@ -470,6 +525,7 @@ fn main() {
             "--no-relax" => cfg.relaxation = false,
             "--steepest" => cfg.sls_rule = types::SlsRule::Steepest,
             "--bench" => do_bench = true,
+            "--deadline-check" => do_deadline = true,
             "--selftest" => {
                 do_self = true;
                 if let Some(n) = args.get(i + 1).and_then(|s| s.parse().ok()) {
@@ -478,7 +534,7 @@ fn main() {
                 }
             }
             "-h" | "--help" => {
-                println!("usage: zsat <file.cnf> [--timeout MS] [--mem MiB] [--seed N] [--model] [--log] [--no-learning] [--no-relax] [--steepest]\n       zsat --bench [--timeout MS]\n       zsat --selftest [COUNT]");
+                println!("usage: zsat <file.cnf> [--timeout MS] [--mem MiB] [--seed N] [--model] [--log] [--no-learning] [--no-relax] [--steepest]\n       zsat --bench [--timeout MS]\n       zsat --selftest [COUNT]\n       zsat --deadline-check");
                 return;
             }
             _ => file = Some(a.to_string()),
@@ -491,6 +547,9 @@ fn main() {
     }
     if do_bench {
         ok &= bench(cfg.timeout_ms);
+    }
+    if do_deadline {
+        ok &= deadline_check();
     }
     if let Some(path) = file {
         let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
@@ -512,7 +571,7 @@ fn main() {
             Status::Unknown => 0,
         });
     }
-    if !do_self && !do_bench {
+    if !do_self && !do_bench && !do_deadline {
         println!("nothing to do; try --selftest or --bench (see --help)");
     }
     if !ok {

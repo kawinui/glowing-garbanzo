@@ -33,12 +33,13 @@ struct ActionResult {
     target_reached: bool,
 }
 
-/// Count clauses of the pristine formula falsified by `assign` into `out`
-/// (one bit per clause) and return the hardware popcount.
-fn eval_into(lits: &[Lit], starts: &[u32], assign: &BitSet, out: &mut BitSet) -> u32 {
-    out.clear_all();
-    let nc = starts.len() - 1;
-    for c in 0..nc {
+/// Clauses between clock reads in the deadline-aware evaluation.
+const EVAL_CHECK: usize = 8192;
+
+/// Mark clauses `c0..c1` of the pristine formula falsified by `assign` in `out`.
+#[inline]
+fn eval_range(lits: &[Lit], starts: &[u32], assign: &BitSet, out: &mut BitSet, c0: usize, c1: usize) {
+    for c in c0..c1 {
         let s = at(starts, c) as usize;
         let e = at(starts, c + 1) as usize;
         let mut sat = false;
@@ -53,7 +54,32 @@ fn eval_into(lits: &[Lit], starts: &[u32], assign: &BitSet, out: &mut BitSet) ->
             out.set(c);
         }
     }
+}
+
+/// Count clauses of the pristine formula falsified by `assign` into `out`
+/// (one bit per clause) and return the hardware popcount. Always runs to
+/// completion (strict verification relies on that).
+fn eval_into(lits: &[Lit], starts: &[u32], assign: &BitSet, out: &mut BitSet) -> u32 {
+    out.clear_all();
+    eval_range(lits, starts, assign, out, 0, starts.len() - 1);
     out.count_ones()
+}
+
+/// Same, but gives up (`None`) once `deadline` has passed, checked every
+/// `EVAL_CHECK` clauses. On `None`, `out` is incomplete and must not be used.
+fn eval_into_by(lits: &[Lit], starts: &[u32], assign: &BitSet, out: &mut BitSet, deadline: Instant) -> Option<u32> {
+    out.clear_all();
+    let nc = starts.len() - 1;
+    let mut c = 0;
+    while c < nc {
+        if past(deadline) {
+            return None;
+        }
+        let e = (c + EVAL_CHECK).min(nc);
+        eval_range(lits, starts, assign, out, c, e);
+        c = e;
+    }
+    Some(out.count_ones())
 }
 
 impl SolverWorkspace {
@@ -209,8 +235,10 @@ impl SolverWorkspace {
     // ---------------- Module 5: anytime tracker + verification ----------------
 
     /// Copy `src` (phase or model) into `model`, override root facts, evaluate
-    /// against the pristine formula, update the anytime best. Returns #unsat.
-    fn assemble_and_eval(&mut self, from_model: bool) -> u32 {
+    /// against the pristine formula, update the anytime best. Returns #unsat,
+    /// or `None` if the evaluation did not finish by `deadline + grace`; in that
+    /// case `best` / `best_unsat` are untouched (they stay consistent).
+    fn assemble_and_eval(&mut self, from_model: bool) -> Option<u32> {
         if !from_model {
             self.model.copy_from(&self.phase);
         }
@@ -218,13 +246,14 @@ impl SolverWorkspace {
             let l = at(&self.trail, i);
             self.model.assign(l.var() as usize, !l.is_neg());
         }
-        let u = eval_into(&self.orig_lits, &self.orig_start, &self.model, &mut self.eval_unsat);
+        let limit = self.deadline + self.grace;
+        let u = eval_into_by(&self.orig_lits, &self.orig_start, &self.model, &mut self.eval_unsat, limit)?;
         if u < self.best_unsat {
             self.best_unsat = u;
             self.best.copy_from(&self.model);
             self.emit(EventKind::NewBest { unsat: u });
         }
-        u
+        Some(u)
     }
 
     /// Strict verification of `model`. On success the solver is Conservative/100%.
@@ -290,7 +319,7 @@ impl SolverWorkspace {
                     let o = self.sls_run(start, target, try_flips, noise, ticker);
                     // phase handoff: warm-start CDCL polarities
                     self.phase.copy_from(&self.sls_best);
-                    let u = self.assemble_and_eval(false);
+                    let Some(u) = self.assemble_and_eval(false) else { break };
                     if u == 0 {
                         r.sat_model = true;
                         break;
@@ -299,7 +328,8 @@ impl SolverWorkspace {
                         r.target_reached = true;
                         break;
                     }
-                    if ticker.expired {
+                    // a fresh start re-initialises all SLS state (atomic, O(literals))
+                    if ticker.expired || past(self.deadline) {
                         break;
                     }
                 }
@@ -317,25 +347,28 @@ impl SolverWorkspace {
             }
             Action::SwitchScoring => {
                 self.hot.hybrid_scoring = !self.hot.hybrid_scoring;
-                if self.hot.hybrid_scoring && self.best_unsat != u32::MAX {
-                    // inject SLS knowledge: variables of clauses violated by the best assignment
-                    let _ = eval_into(&self.orig_lits, &self.orig_start, &self.best, &mut self.eval_unsat);
-                    let inc = self.hot.inc.max(1);
-                    for c in 0..self.n_orig as usize {
-                        if self.eval_unsat.get(c) {
-                            let (s, e) = self.orig_range(c);
-                            for k in s..e {
-                                let v = at(&self.orig_lits, k).var();
-                                self.bump_raw(v, inc);
+                if self.hot.hybrid_scoring && self.has_best() {
+                    // inject SLS knowledge: variables of clauses violated by the best
+                    // assignment (optional: skipped if the evaluation cannot finish in time)
+                    let dl = self.deadline;
+                    if eval_into_by(&self.orig_lits, &self.orig_start, &self.best, &mut self.eval_unsat, dl).is_some() {
+                        let inc = self.hot.inc.max(1);
+                        for c in 0..self.n_orig as usize {
+                            if self.eval_unsat.get(c) {
+                                let (s, e) = self.orig_range(c);
+                                for k in s..e {
+                                    let v = at(&self.orig_lits, k).var();
+                                    self.bump_raw(v, inc);
+                                }
                             }
                         }
+                        self.order_rebuild();
                     }
-                    self.order_rebuild();
                 }
                 self.run_cdcl(ticker, &mut r);
             }
             Action::CdclBestPhase => {
-                if self.best_unsat != u32::MAX {
+                if self.has_best() {
                     self.phase.copy_from(&self.best);
                 }
                 self.run_cdcl(ticker, &mut r);
@@ -355,11 +388,16 @@ impl SolverWorkspace {
     pub fn solve(&mut self) -> Status {
         self.t0 = Instant::now();
         let global_end = self.t0 + Duration::from_millis(self.cfg.timeout_ms);
+        self.deadline = global_end;
+        self.grace = Duration::from_millis((self.cfg.timeout_ms / 20).clamp(5, 50));
+        let pre_us = (self.cfg.timeout_ms as u128 * self.cfg.preprocess_budget_ppm as u128 / 1000) as u64;
+        self.pre_budget = Duration::from_micros(pre_us);
         self.log.clear();
         self.mode_log.clear();
 
-        // Preprocessing runs strict (everything active) — Module 6.
-        let (r, st) = self.preprocess(2);
+        // Preprocessing runs strict (everything active) — Module 6. Only its
+        // first root rebuild is mandatory; the rest stops at the preprocess budget.
+        let (r, st) = self.preprocess(2, (self.t0 + self.pre_budget).min(global_end));
         self.emit(EventKind::Preprocess { fixed: st.fixed, subsumed: st.subsumed, pure: st.pure });
         if r == Root::Conflict {
             if let Some(t) = self.ctrl.force(Mode::Conservative, Why::ProofEscalation) {
@@ -405,11 +443,12 @@ impl SolverWorkspace {
             if ar.root_conflict {
                 return self.on_root_conflict();
             }
+            // A `None` (no time left to evaluate) drops the result, never the invariants.
             if ar.sat_model {
-                self.assemble_and_eval(true);
+                let _ = self.assemble_and_eval(true);
             } else if a != Action::Sls {
                 // CDCL / probing: evaluate the saved-phase assignment
-                self.assemble_and_eval(false);
+                let _ = self.assemble_and_eval(false);
             }
             if self.best_unsat == 0 {
                 self.model.copy_from(&self.best);
@@ -437,12 +476,21 @@ impl SolverWorkspace {
             self.emit(EventKind::Action { action: a, reward: rw, best_unsat: self.best_unsat, mode });
             self.ctrl.account(a.is_cdcl(), (Instant::now() - now).as_micros() as u64);
 
+            // Past the deadline only the final evaluation above was allowed:
+            // skip tighten / FSM transition / in-processing (rebuilds are atomic).
+            if past(global_end) {
+                break;
+            }
+
             // ---- iterative strengthening (Module 1) ----
             if !self.relax_exhausted()
                 && (ar.target_reached || (!improved && ticker.expired))
                 && self.tighten(ar.target_reached) == Root::Conflict
             {
                 return self.on_root_conflict();
+            }
+            if past(global_end) {
+                break;
             }
 
             // ---- FSM with hysteresis ----
@@ -470,6 +518,18 @@ impl SolverWorkspace {
 
 #[doc(hidden)]
 impl SolverWorkspace {
+    /// Diagnostic: measured cost in ms of one full root rebuild and one full
+    /// pristine-formula evaluation (the two atomic units that bound overshoot).
+    /// Run on a fresh workspace; it leaves no root facts behind.
+    pub fn diag_costs(&mut self) -> (f64, f64) {
+        let t = Instant::now();
+        let _ = self.root_simplify_and_rebuild();
+        let rebuild = t.elapsed().as_secs_f64() * 1e3;
+        let t = Instant::now();
+        let _ = eval_into(&self.orig_lits, &self.orig_start, &self.model, &mut self.eval_unsat);
+        (rebuild, t.elapsed().as_secs_f64() * 1e3)
+    }
+
     /// Diagnostic: run pure SLS (strict, all clauses) for `ms`. Returns (best unsat, flips).
     pub fn diag_sls(&mut self, ms: u64) -> (u32, u64) {
         let end = Instant::now() + Duration::from_millis(ms);

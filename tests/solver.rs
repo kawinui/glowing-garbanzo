@@ -229,3 +229,39 @@ fn solver_is_reusable_only_via_fresh_workspace_but_deterministic() {
     let b = { let mut s = Solver::new(&f, cfg(5000)).unwrap(); s.solve() };
     assert_eq!(a, b);
 }
+
+/// Release-only: `check_watches` makes debug builds far too slow to time.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn deadline_respected_on_mid_instance() {
+    let f = random_ksat(300_000, 1_200_000, 3, 7); // ratio 4.0
+    for ms in [50u64, 1000] {
+        let mut s = Solver::new(&f, Config { timeout_ms: ms, memory_budget: 512 << 20, ..Config::default() }).unwrap();
+        let t = std::time::Instant::now();
+        let (st, allocs) = solve_counting(&mut s);
+        let el = t.elapsed().as_millis() as u64;
+        assert_eq!(allocs, 0);
+        assert!(el <= ms + 100, "timeout {ms} ms: solve() took {el} ms");
+        if st == Status::Sat {
+            assert_eq!(violated(&f, |v| s.model_value(v)), 0);
+        }
+    }
+}
+
+#[test]
+fn unknown_reports_best_honestly() {
+    let f = random_ksat(100_000, 400_000, 3, 9);
+    for ms in [1u64, 2, 5] {
+        let mut s = Solver::new(&f, Config { timeout_ms: ms, memory_budget: 256 << 20, ..Config::default() }).unwrap();
+        let (st, allocs) = solve_counting(&mut s);
+        assert_eq!(allocs, 0);
+        if st != Status::Unknown {
+            continue;
+        }
+        if s.has_best() {
+            assert_eq!(violated(&f, |v| s.best_value(v)), s.best_unsat as usize, "timeout {ms} ms");
+        } else {
+            assert_eq!(s.best_unsat, u32::MAX, "timeout {ms} ms");
+        }
+    }
+}

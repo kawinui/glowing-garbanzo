@@ -10,6 +10,11 @@ use crate::arena::SolverWorkspace;
 use crate::propagate::Root;
 use crate::types::*;
 use crate::util::*;
+use std::time::Instant;
+
+/// Clauses between clock reads in the linear passes.
+const SUBSUME_CHECK: usize = 1024;
+const PURE_CHECK: usize = 4096;
 
 #[derive(Copy, Clone, Debug, Default)]
 pub struct PreStats {
@@ -25,10 +30,18 @@ fn var_sig(v: Var) -> u64 {
 
 impl SolverWorkspace {
     /// Pure literal elimination. Returns the number of literals fixed.
-    pub(crate) fn pure_literal_pass(&mut self) -> u32 {
+    ///
+    /// Stoppable only while *counting*: past `deadline` it returns 0 without
+    /// having enqueued anything. Once the enqueue phase starts it runs to
+    /// completion, and the caller must follow a non-zero result with
+    /// `root_simplify_and_rebuild` (the new units are not propagated here).
+    pub(crate) fn pure_literal_pass(&mut self, deadline: Instant) -> u32 {
         debug_assert_eq!(self.hot.dlevel, 0);
         self.lit_count.fill(0);
         for c in 0..self.n_orig as usize {
+            if c % PURE_CHECK == 0 && past(deadline) {
+                return 0;
+            }
             let h = at(&self.hdr, c);
             if h.flags & F_DELETED != 0 {
                 continue;
@@ -70,10 +83,16 @@ impl SolverWorkspace {
 
     /// Backward subsumption over live original clauses (requires a fresh
     /// `root_simplify_and_rebuild`, so all remaining literals are unassigned).
-    pub(crate) fn subsumption_pass(&mut self, mut budget: i64) -> u32 {
+    ///
+    /// Stoppable at any outer-clause boundary: a clause is flagged deleted only
+    /// after it has been proven subsumed, so stopping early just removes fewer.
+    pub(crate) fn subsumption_pass(&mut self, mut budget: i64, deadline: Instant) -> u32 {
         debug_assert_eq!(self.hot.dlevel, 0);
         let n = self.n_orig as usize;
         for c in 0..n {
+            if c % PURE_CHECK == 0 && past(deadline) {
+                return 0; // signatures only; nothing deleted yet
+            }
             let h = at(&self.hdr, c);
             let mut s = 0u64;
             if h.flags & F_DELETED == 0 {
@@ -85,7 +104,7 @@ impl SolverWorkspace {
         }
         let mut removed = 0u32;
         for c in 0..n {
-            if budget <= 0 {
+            if budget <= 0 || (c % SUBSUME_CHECK == 0 && past(deadline)) {
                 break;
             }
             let hc = at(&self.hdr, c);
@@ -144,21 +163,38 @@ impl SolverWorkspace {
     }
 
     /// Full preprocessing: `rounds` × (UP + simplify, pure literals, subsumption).
-    pub(crate) fn preprocess(&mut self, rounds: u32) -> (Root, PreStats) {
+    ///
+    /// The first `root_simplify_and_rebuild` is mandatory (it builds every
+    /// watch). Everything after it is optional and skipped once `deadline`
+    /// has passed; a rebuild that follows an enqueued pure-literal batch is
+    /// never skipped.
+    pub(crate) fn preprocess(&mut self, rounds: u32, deadline: Instant) -> (Root, PreStats) {
         self.backtrack(0);
         let mut st = PreStats::default();
         let root0 = self.hot.trail_len;
-        for _ in 0..rounds {
+        for round in 0..rounds {
+            if round > 0 && past(deadline) {
+                self.emit(EventKind::Skipped { what: Skip::PreprocessRound });
+                break;
+            }
             if self.root_simplify_and_rebuild() == Root::Conflict {
                 return (Root::Conflict, st);
             }
-            let p = self.pure_literal_pass();
+            if past(deadline) {
+                self.emit(EventKind::Skipped { what: Skip::PurePass });
+                break;
+            }
+            let p = self.pure_literal_pass(deadline);
             st.pure += p;
             if p > 0 && self.root_simplify_and_rebuild() == Root::Conflict {
                 return (Root::Conflict, st);
             }
+            if past(deadline) {
+                self.emit(EventKind::Skipped { what: Skip::Subsumption });
+                break;
+            }
             let budget = (self.layout.orig_lits as i64 * 8).max(1 << 16);
-            let s = self.subsumption_pass(budget);
+            let s = self.subsumption_pass(budget, deadline);
             st.subsumed += s;
             if p == 0 && s == 0 {
                 break;
@@ -168,17 +204,32 @@ impl SolverWorkspace {
         (Root::Ok, st)
     }
 
-    /// Cheap in-processing round (tier change / major restart).
+    /// Cheap in-processing round (tier change / major restart). Optional work:
+    /// not started at all once the global deadline has passed, and its pure /
+    /// subsumption passes also stop at `pre_budget` after the call.
     pub(crate) fn inprocess(&mut self) -> Root {
         self.backtrack(0);
+        if past(self.deadline) {
+            self.emit(EventKind::Skipped { what: Skip::Inprocess });
+            return Root::Ok;
+        }
+        let stop = (Instant::now() + self.pre_budget).min(self.deadline);
         if self.root_simplify_and_rebuild() == Root::Conflict {
             return Root::Conflict;
         }
-        if self.pure_literal_pass() > 0 && self.root_simplify_and_rebuild() == Root::Conflict {
+        if past(stop) {
+            self.emit(EventKind::Skipped { what: Skip::PurePass });
+            return Root::Ok;
+        }
+        if self.pure_literal_pass(stop) > 0 && self.root_simplify_and_rebuild() == Root::Conflict {
             return Root::Conflict;
         }
+        if past(stop) {
+            self.emit(EventKind::Skipped { what: Skip::Subsumption });
+            return Root::Ok;
+        }
         let budget = (self.layout.orig_lits as i64).max(1 << 14);
-        self.subsumption_pass(budget);
+        self.subsumption_pass(budget, stop);
         Root::Ok
     }
 }

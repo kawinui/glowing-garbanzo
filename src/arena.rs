@@ -7,7 +7,7 @@
 use crate::controller::{Controller, QTable};
 use crate::types::*;
 use crate::util::*;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
 // Input formula (CSR, normalized). Allocation here is load time.
@@ -300,6 +300,12 @@ pub struct SolverWorkspace {
     pub mode_log: EventLog,
     pub best_unsat: u32,
     pub(crate) t0: Instant,
+    /// Global deadline (`t0 + timeout`), set by `solve()`.
+    pub(crate) deadline: Instant,
+    /// Extra time the final evaluation may use past `deadline`.
+    pub(crate) grace: Duration,
+    /// Length of the optional pre-/in-processing budget.
+    pub(crate) pre_budget: Duration,
     pub(crate) epoch: u32,
 }
 
@@ -407,6 +413,9 @@ impl SolverWorkspace {
             mode_log: EventLog::new(),
             best_unsat: u32::MAX,
             t0: Instant::now(),
+            deadline: Instant::now(),
+            grace: Duration::ZERO,
+            pre_budget: Duration::ZERO,
             epoch: 0,
         };
 
@@ -464,6 +473,12 @@ impl SolverWorkspace {
     /// Anytime best assignment (valid after any result).
     pub fn best_value(&self, v: Var) -> bool {
         self.best.get(v as usize)
+    }
+    /// True once any assignment has been evaluated; `best`/`best_unsat` are
+    /// meaningless (sentinel `u32::MAX`) before that.
+    #[inline]
+    pub fn has_best(&self) -> bool {
+        self.best_unsat != u32::MAX
     }
     pub fn elapsed_us(&self) -> u64 {
         self.t0.elapsed().as_micros() as u64

@@ -109,8 +109,12 @@ impl SolverWorkspace {
         let mut cand = [0u32; PROBE_K];
         let nc = self.select_probe_candidates(&mut cand);
         let p0 = self.stats.propagations;
+        let mut last = p0;
         for &v in cand.iter().take(nc) {
-            if self.stats.propagations - p0 > prop_budget || ticker.tick() {
+            let now_p = self.stats.propagations;
+            let units = work_units(now_p - last);
+            last = now_p;
+            if now_p - p0 > prop_budget || ticker.tick_n(units) {
                 break;
             }
             if self.is_assigned(v) {
